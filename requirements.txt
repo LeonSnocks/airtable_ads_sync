@@ -1,0 +1,31 @@
+# Function dependencies, for example:
+# package>=version
+
+requests
+sqlalchemy
+google-cloud-secret-manager
+google-cloud-bigquery
+pg8000
+pendulum
+httpx
+pandas
+pyarrow
+db-dtypes
+pandas-gbq
+google-api-python-client # for gsheets to bq
+random2
+protobuf==5.29.3
+openpyxl #enable viewing Excel sheets (DATEV)
+cloud-sql-python-connector[pg8000] # googles sql connector
+google-cloud-firestore
+tqdm
+
+# legacy requirements:
+tenacity
+loguru
+aiohttp
+python-dotenv
+sendgrid
+paramiko
+google-analytics-data # https://oceans-apart.atlassian.net/browse/ITS-2566
+google-cloud-storage

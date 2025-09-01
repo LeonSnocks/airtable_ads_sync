@@ -1,0 +1,7 @@
+# lokale Keys NIEMALS committen
+secrets/
+*.json
+.env
+.venv
+__pycache__/
+gcloudignore
