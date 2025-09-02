@@ -25,6 +25,33 @@ from decimal import Decimal
 from typing import Any, Dict, List
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import logging, sys
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+log = logging.getLogger(__name__)
+
+class BadGateway(Exception): ...
+class GatewayTimeout(Exception): ...
+
+
+def _retry_session() -> requests.Session:
+    retry = Retry(
+        total=4,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
+    s = requests.Session()
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+HTTP = _retry_session()
+
 from google.cloud import bigquery  # noqa: F401 (imported for context)
 from google.cloud import secretmanager  # noqa: F401 (imported for context)
 from tqdm import tqdm
@@ -148,12 +175,26 @@ def fetch_airtable_index(company: str, api_key: str) -> Dict[str, Dict[str, Any]
     offset: str | None = None
 
     while True:
-        params: Dict[str, Any] = {"pageSize": 100}
+        params: Dict[str, Any] = {
+            "pageSize": 50,
+            "fields[]": [AT_EXTERNAL_ID, AT_FIELD1, AT_FIELD2, AT_FIELD3],
+        }
         if offset:
             params["offset"] = offset
 
-        r = requests.get(url, headers=headers, params=params, timeout=30)
-        r.raise_for_status()
+        try:
+            r = HTTP.get(url, headers=headers, params=params, timeout=(5, 15))
+            if r.status_code == 429:
+                log.error("Airtable 429 after retries (company=%s)", company)
+                raise BadGateway("airtable_rate_limited")
+            r.raise_for_status()
+        except requests.Timeout:
+            log.exception("Airtable timeout while listing (company=%s)", company)
+            raise GatewayTimeout("airtable_timeout")
+        except requests.RequestException:
+            log.exception("Airtable request failed while listing (company=%s)", company)
+            raise BadGateway("airtable_request_failed")
+
         data = r.json()
 
         for rec in data.get("records", []):
@@ -166,7 +207,6 @@ def fetch_airtable_index(company: str, api_key: str) -> Dict[str, Dict[str, Any]
                     "f2": f.get(AT_FIELD2),
                     "f3": f.get(AT_FIELD3),
                 }
-            print(f"Loaded Airtable record: {ext}")
 
         offset = data.get("offset")
         if not offset:
@@ -235,31 +275,26 @@ def _retryable_request(method: str, url: str, headers: Dict[str, str], json: Dic
     """HTTP call with simple exponential backoff for 429/5xx and verbose logging."""
     last_resp = None
     for attempt in range(6):
-        r = requests.request(method, url, headers=headers, json=json, timeout=timeout)
+        try:
+            r = HTTP.request(method, url, headers=headers, json=json, timeout=(5, timeout))
+        except requests.Timeout:
+            log.warning("Airtable %s timeout on attempt %d", method, attempt + 1)
+            time.sleep(2 ** attempt * 0.5)
+            continue
         last_resp = r
         if r.status_code in (429, 500, 502, 503, 504):
-            try:
-                print(f"Airtable retryable status {r.status_code}: {r.text}")
-            except Exception:
-                pass
+            log.warning("Airtable %s retryable status %s: %s", method, r.status_code, r.text[:200])
             time.sleep(2 ** attempt * 0.5)
             continue
         if r.status_code >= 400:
-            try:
-                print(f"Airtable error {r.status_code}: {r.text}")
-            except Exception:
-                pass
+            log.error("Airtable %s error %s: %s", method, r.status_code, r.text[:200])
             r.raise_for_status()
         r.raise_for_status()
         return r
 
-    # If all attempts fail, raise with the last response text
     if last_resp is not None:
-        try:
-            msg = f"Airtable request failed after retries. Status {last_resp.status_code}: {last_resp.text}"
-        except Exception:
-            msg = f"Airtable request failed after retries. Status {last_resp.status_code}"
-        raise requests.HTTPError(msg, response=last_resp)
+        msg = f"Airtable request failed after retries. Status {last_resp.status_code}: {last_resp.text[:200]}"
+        raise BadGateway(msg)
 
     raise requests.HTTPError("Airtable request failed with no response received.")
 
@@ -301,7 +336,7 @@ def run_sync(company: str) -> Dict[str, int]:
 
     # 2) Fetch rows from BigQuery
     rows = fetch_bq_rows(company)
-    print(len(rows))
+    log.info("Fetched %d BQ rows for %s", len(rows), company)
 
     # 3) Diff: create / update / skip  (NO deletes)
     creates: List[Dict[str, Any]] = []
@@ -316,7 +351,7 @@ def run_sync(company: str) -> Dict[str, int]:
         if ext not in at_index:
             # Create: include external id and dedupe by external id
             if ext not in seen_creates_ext:
-                print(f"New: {ext}")
+                log.info("Create planned: %s", ext)
                 create_fields = {**payload_fields, AT_EXTERNAL_ID: ext}
                 creates.append({"fields": create_fields})
                 seen_creates_ext.add(ext)
@@ -336,9 +371,7 @@ def run_sync(company: str) -> Dict[str, int]:
                 cur.get("f3"),
             )
             if current_tuple != desired_tuple:
-                print(
-                    f"Update needed for {ext}: current={current_tuple} -> desired={desired_tuple}"
-                )
+                log.info("Update planned for %s", ext)
                 # If the same record requires multiple updates, keep only the last one.
                 updates_by_id[cur["rid"]] = {"id": cur["rid"], "fields": payload_fields}
             else:
@@ -358,16 +391,25 @@ def run_sync(company: str) -> Dict[str, int]:
 # ------------------------------
 
 def my_function(request):
-    """HTTP entrypoint for Cloud Functions (2nd gen). """
-    print("🚀 Sync started.")
-
-    snocks_result = run_sync(company="Snocks")
-    oa_result = run_sync(company="OA")
-    
-    result = {"Snocks": snocks_result, "OA": oa_result}
-
-    print(f"✅ Done: {result}")
-    return (f"OK: {result}", 200)
+    """HTTP entrypoint for Cloud Functions (2nd gen)."""
+    log.info("🚀 Sync started.")
+    results = {}
+    status = 200
+    for company in ("Snocks", "OA"):
+        try:
+            results[company] = run_sync(company=company)
+        except GatewayTimeout as e:
+            results[company] = {"error": str(e)}
+            status = max(status, 504)
+        except BadGateway as e:
+            results[company] = {"error": str(e)}
+            status = max(status, 502)
+        except Exception:
+            log.exception("Unhandled error in %s", company)
+            results[company] = {"error": "internal"}
+            status = max(status, 500)
+    log.info("✅ Done: %s", results)
+    return ({"result": results}, status)
 
 
 # ------------------------------
