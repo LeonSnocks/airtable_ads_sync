@@ -64,9 +64,12 @@ BQ_DATASET = "marts_finance_euw3"
 BQ_TABLE = "ad_create_roas"
 
 # Airtable
-AIRTABLE_BASE_SNOCKS = "app91jmdmjCxpVmig"  
+AIRTABLE_BASE_SNOCKS_DEV = "app91jmdmjCxpVmig"
+AIRTABLE_BASE_OA_DEV = "apprHKYwMV8JWxeYk"  
+ 
+AIRTABLE_BASE_SNOCKS = "appSC6U99N8701HKf"  
 AIRTABLE_TABLE_SNOCKS = "tblkAk6Q9ZgG9LyTz"  
-AIRTABLE_BASE_OA = "apprHKYwMV8JWxeYk"  
+AIRTABLE_BASE_OA = "app0N8ejLt45NY0Hg"  
 AIRTABLE_TABLE_OA = "tblkAk6Q9ZgG9LyTz"  
 
 # Field mapping: BigQuery -> Airtable

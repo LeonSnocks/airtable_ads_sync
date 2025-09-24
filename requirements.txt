@@ -2,6 +2,7 @@
 # package>=version
 
 requests
+urllib3
 sqlalchemy
 google-cloud-secret-manager
 google-cloud-bigquery
