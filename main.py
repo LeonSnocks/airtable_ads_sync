@@ -341,11 +341,15 @@ def run_sync(company: str) -> Dict[str, int]:
     rows = fetch_bq_rows(company)
     log.info("Fetched %d BQ rows for %s", len(rows), company)
 
-    # 3) Diff: create / update / skip  (NO deletes)
+    # 3) Diff: create / update / skip  
     creates: List[Dict[str, Any]] = []
+    
     updates_by_id: Dict[str, Dict[str, Any]] = {}  # rid -> payload (dedupe so each record appears once per batch)
     seen_creates_ext: set[str] = set()
     skipped = 0
+    deleted_full_clears: list[dict[str, str]] = []
+    deleted_partial_clears: list[dict[str, str]] = []
+
 
     for r in rows:
         ext = r["external_id"]
@@ -380,7 +384,79 @@ def run_sync(company: str) -> Dict[str, int]:
             else:
                 skipped += 1
 
+    #when id has values in airtable but not in bq we delete the values
+        # 3b) Clear Airtable fields when the external_id is gone in BQ
+    #     or when BQ has NULL for a field that is still set in Airtable.
+    bq_by_ext = {r["external_id"]: r for r in rows}
+
+    for ext, rec in at_index.items():
+        rec_id = rec["rid"]
+        bq_row = bq_by_ext.get(ext)
+
+        if bq_row is None:
+            # external_id existiert in Airtable, aber nicht mehr in BQ → alle Werte leeren
+            if any(v is not None for v in (rec.get("f1"), rec.get("f2"), rec.get("f3"))):
+                log.info("Clear fields (no longer in BQ) for %s", ext)
+                updates_by_id[rec_id] = {
+                    "id": rec_id,
+                    "fields": {
+                        AT_FIELD1: None,
+                        AT_FIELD2: None,
+                        AT_FIELD3: None,
+                    },
+                }
+                # >>> Debug-Tracking
+            deleted_full_clears.append({
+                "company": company,
+                "external_id": ext,
+                "airtable_record_id": rec_id,
+                "reason": "external_id_not_in_bq"
+            })
+            continue
+
+        # BQ existiert, aber einzelne Felder sind dort NULL → nur diese Felder in AT leeren
+        to_clear = {}
+        if bq_row.get("f1") is None and rec.get("f1") is not None:
+            to_clear[AT_FIELD1] = None
+        if bq_row.get("f2") is None and rec.get("f2") is not None:
+            to_clear[AT_FIELD2] = None
+        if bq_row.get("f3") is None and rec.get("f3") is not None:
+            to_clear[AT_FIELD3] = None
+
+        if to_clear:
+            log.info("Clear partial fields for %s: %s", ext, ", ".join(to_clear.keys()))
+            updates_by_id[rec_id] = {"id": rec_id, "fields": to_clear}
+            # >>> Debug-Tracking
+            deleted_partial_clears.append({
+                "company": company,
+                "external_id": ext,
+                "airtable_record_id": rec_id,
+                "cleared_fields": list(to_clear.keys()),
+                "reason": "fields_null_in_bq"
+            })
+
     updates = list(updates_by_id.values())
+
+    # Debug-JSON schreiben (lokal in CWD, in Cloud Functions nach /tmp)
+    try:
+        out_path = f"airtable_delete_updates_{company}.json" if os.getenv("K_SERVICE") else f"airtable_delete_updates{company}.json"
+        debug_payload = {
+            "company": company,
+            "timestamp": int(time.time()),
+            "full_clears": deleted_full_clears,
+            "partial_clears": deleted_partial_clears,
+            "counts": {
+                "full_clears": len(deleted_full_clears),
+                "partial_clears": len(deleted_partial_clears),
+            },
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            import json
+            json.dump(debug_payload, f, ensure_ascii=False, indent=2)
+        log.info("Wrote delete-debug JSON to %s (full=%d, partial=%d)",
+                 out_path, len(deleted_full_clears), len(deleted_partial_clears))
+    except Exception:
+        log.exception("Failed to write delete-debug JSON")
 
     # 4) Write changes
     # write_creates(company, api_key, creates)  # enable when you want to create new records
