@@ -12,7 +12,7 @@ Notes
 - Authentication for BigQuery and Secret Manager is expected via
   Application Default Credentials (ADC) in Cloud Functions.
 - The Airtable API key is fetched from Secret Manager.
-- Updates are de‑duplicated per Airtable record ID to avoid the
+- Updates are de-duplicated per Airtable record ID to avoid the
   "duplicate updates in one request" error.
 """
 
@@ -111,65 +111,65 @@ essential_tables = {"Snocks": (AIRTABLE_BASE_SNOCKS, AIRTABLE_TABLE_SNOCKS), "OA
 
 
 def _airtable_url(company: str) -> str:
-    """Return the v0 Airtable endpoint URL for a given company label.
-
-    Parameters
-    ----------
-    company: str
-        Either "Snocks" or "OA".
-    """
+    """Return the v0 Airtable endpoint URL for a given company label."""
+    company = _normalize_company_label(company)   # <-- NEW
     AIRTABLE_BASE, AIRTABLE_TABLE = essential_tables[company]
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_TABLE}"
+
+def _normalize_company_label(label: str) -> str:
+    """Return canonical label used in this script: 'Snocks' or 'OA'."""
+    c = (label or "").strip().lower()
+    if c in ("snocks",):
+        return "Snocks"
+    if c in ("oa", "oceansapart"):
+        return "OA"
+    raise ValueError("company must be 'Snocks' or 'OA'")
+
+def _bq_company_value(company_label: str) -> str:
+    """Return the value used in BigQuery's 'company' column for a given label."""
+    if company_label == "OA":
+        return "Oceansapart"   # <-- OA steht für Oceansapart
+    if company_label == "Snocks":
+        return "snocks"         # <-- so steht es in deiner Query/Tabelle
+    raise ValueError("Unsupported company label")
 
 
 # ------------------------------
 # BigQuery fetch
 # ------------------------------
 
-def fetch_bq_rows(company: str = "Snocks", prefixes: tuple[str, ...] = ("OA", "OIT", "OFR", "OPL", "OEU")) -> List[Dict[str, Any]]:
-    """Load rows once and split by external_id prefix membership.
-
-    When `company == 'OA'`, rows whose external_id starts with any of
-    `prefixes` are returned; otherwise the remaining rows are returned
-    (for `company == 'Snocks'`).
-    """
-    # Build regex like ^(OA|OIT|OFR|OPL|OEU)
-    regex = "^(" + "|".join(prefixes) + ")"
+def fetch_bq_rows(company: str = "Snocks") -> List[Dict[str, Any]]:
+    """Load rows for the given company based on the explicit 'company' column from BigQuery."""
+    company_label = _normalize_company_label(company)
+    bq_company = _bq_company_value(company_label)
 
     sql = f"""
     SELECT
+      company,
       CAST({BQ_EXTERNAL_ID_COL} AS STRING) AS external_id,
       {BQ_FIELD1_COL} AS f1,
       {BQ_FIELD2_COL} AS f2,
       {BQ_FIELD3_COL} AS f3,
-      FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E3SZ', CAST({BQ_FIELD4_COL} AS TIMESTAMP)) AS f4,
-      REGEXP_CONTAINS(CAST({BQ_EXTERNAL_ID_COL} AS STRING), r'{regex}') AS is_matched
+      FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E3SZ', CAST({BQ_FIELD4_COL} AS TIMESTAMP)) AS f4
     FROM `{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}`
+    WHERE company = @company
     """
 
-    rows_oa: List[Dict[str, Any]] = []
-    rows_snocks: List[Dict[str, Any]] = []
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("company", "STRING", bq_company)]
+    )
 
-    for r in bq_client.query(sql).result():
-        row = {
+    rows: List[Dict[str, Any]] = []
+    for r in bq_client.query(sql, job_config=job_config).result():
+        rows.append({
+            "company": r["company"],      # für Debug/Transparenz
             "external_id": r["external_id"],
             "f1": r.get("f1"),
             "f2": r.get("f2"),
             "f3": r.get("f3"),
             "f4": r.get("f4"),
-        }
-        if r["is_matched"]:
-            rows_oa.append(row)
-        else:
-            rows_snocks.append(row)
-
-    if company == "Snocks":
-        return rows_snocks
-    elif company == "OA":
-        return rows_oa
-    else:
-        raise ValueError("company must be 'Snocks' or 'OA'")
-
+        })
+    return rows
 
 def fetch_airtable_index(company: str, api_key: str) -> Dict[str, Dict[str, Any]]:
     """Fetch all rows from Airtable and index them by the external id.
@@ -337,15 +337,19 @@ def write_updates(company: str, api_key: str, records: List[Dict[str, Any]]):
 # ------------------------------
 
 def run_sync(company: str) -> Dict[str, int]:
-    """Run a sync for the given company label ("Snocks" or "OA")."""
+    
+    """Run a sync for the given company label ('Snocks' or 'OA')."""
+    company = _normalize_company_label(company)  # <-- NEW (zentrale Normalisierung)
+
     api_key = get_credentials_from_secret_manager(AIRTABLE_SECRET_NAME)
 
-    # 1) Build Airtable index (external_id -> record)
+    # 1) Airtable-Index (per Base der Company)
     at_index = fetch_airtable_index(company, api_key)
 
-    # 2) Fetch rows from BigQuery
+    # 2) BigQuery-Zeilen nur für diese Company
     rows = fetch_bq_rows(company)
     log.info("Fetched %d BQ rows for %s", len(rows), company)
+
 
     # 3) Diff: create / update / skip  
     creates: List[Dict[str, Any]] = []
@@ -356,6 +360,13 @@ def run_sync(company: str) -> Dict[str, int]:
     deleted_full_clears: list[dict[str, str]] = []
     deleted_partial_clears: list[dict[str, str]] = []
 
+    def _merge_update(upd_by_id: Dict[str, Dict[str, Any]], rec_id: str, fields: Dict[str, Any]) -> None:
+        """Merge fields into an existing update for rec_id instead of overwriting it.
+        Clears (None) should override previous values for the same keys."""
+        if rec_id in upd_by_id:
+            upd_by_id[rec_id]["fields"].update(fields)
+        else:
+            upd_by_id[rec_id] = {"id": rec_id, "fields": dict(fields)}
 
     for r in rows:
         ext = r["external_id"]
@@ -371,7 +382,7 @@ def run_sync(company: str) -> Dict[str, int]:
             else:
                 skipped += 1
         else:
-            # Update: dedupe by Airtable record id; last write wins
+            # Update: dedupe by Airtable record id; merge so we don't lose fields later
             cur = at_index[ext]
             desired_tuple = (
                 payload_fields.get(AT_FIELD1),
@@ -379,21 +390,19 @@ def run_sync(company: str) -> Dict[str, int]:
                 payload_fields.get(AT_FIELD3),
                 payload_fields.get(AT_FIELD4),
             )
-            current_tuple = (
-                cur.get("f1"),
-                cur.get("f2"),
-                cur.get("f3"),
-                cur.get("f4"),
-            )
+            f1 = cur.get("f1") or 0.0
+            f2 = cur.get("f2") or 0.0
+            f3 = cur.get("f3") or 0.0
+            f4 = cur.get("f4")
+
+            current_tuple = (f1, f2, f3, f4)
             if current_tuple != desired_tuple:
                 log.info("Update planned for %s", ext)
-                # If the same record requires multiple updates, keep only the last one.
-                updates_by_id[cur["rid"]] = {"id": cur["rid"], "fields": payload_fields}
+                _merge_update(updates_by_id, cur["rid"], payload_fields)
             else:
                 skipped += 1
 
-    #when id has values in airtable but not in bq we delete the values
-        # 3b) Clear Airtable fields when the external_id is gone in BQ
+    # 3b) Clear Airtable fields when the external_id is gone in BQ
     #     or when BQ has NULL for a field that is still set in Airtable.
     bq_by_ext = {r["external_id"]: r for r in rows}
 
@@ -405,16 +414,17 @@ def run_sync(company: str) -> Dict[str, int]:
             # external_id existiert in Airtable, aber nicht mehr in BQ → alle Werte leeren
             if any(v is not None for v in (rec.get("f1"), rec.get("f2"), rec.get("f3"), rec.get("f4"))):
                 log.info("Clear fields (no longer in BQ) for %s", ext)
-                updates_by_id[rec_id] = {
-                    "id": rec_id,
-                    "fields": {
+                _merge_update(
+                    updates_by_id,
+                    rec_id,
+                    {
                         AT_FIELD1: None,
                         AT_FIELD2: None,
                         AT_FIELD3: None,
                         AT_FIELD4: None,
                     },
-                }
-                # >>> Debug-Tracking
+                )
+            # >>> Debug-Tracking
             deleted_full_clears.append({
                 "company": company,
                 "external_id": ext,
@@ -426,17 +436,17 @@ def run_sync(company: str) -> Dict[str, int]:
         # BQ existiert, aber einzelne Felder sind dort NULL → nur diese Felder in AT leeren
         to_clear = {}
         if bq_row.get("f1") is None and rec.get("f1") is not None:
-            to_clear[AT_FIELD1] = None
+            to_clear[AT_FIELD1] = 0.0
         if bq_row.get("f2") is None and rec.get("f2") is not None:
-            to_clear[AT_FIELD2] = None
+            to_clear[AT_FIELD2] = 0.0
         if bq_row.get("f3") is None and rec.get("f3") is not None:
-            to_clear[AT_FIELD3] = None
+            to_clear[AT_FIELD3] = 0.0
         if bq_row.get("f4") is None and rec.get("f4") is not None:
             to_clear[AT_FIELD4] = None
 
         if to_clear:
             log.info("Clear partial fields for %s: %s", ext, ", ".join(to_clear.keys()))
-            updates_by_id[rec_id] = {"id": rec_id, "fields": to_clear}
+            _merge_update(updates_by_id, rec_id, to_clear)
             # >>> Debug-Tracking
             deleted_partial_clears.append({
                 "company": company,
@@ -470,7 +480,7 @@ def run_sync(company: str) -> Dict[str, int]:
         log.exception("Failed to write delete-debug JSON")
 
     # 4) Write changes
-    # write_creates(company, api_key, creates)  # enable when you want to create new records
+    # write_creates(company, api_key, creates)  # enable if you want to create new records too
     write_updates(company, api_key, updates)
 
     return {"created": len(creates), "updated": len(updates), "skipped": skipped}
